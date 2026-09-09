@@ -43,6 +43,30 @@ else
   ls -d "$HOME"/*/ 2>/dev/null | head -15
 fi
 echo
+echo "=== 5b. waar staan je projecten volgens je historie? ==="
+SUGGEST=""
+if [ -d "$PROJ" ]; then
+  _t=$(mktemp)
+  for d in "$PROJ"/*/; do
+    [ -d "$d" ] || continue
+    f=$(find "$d" -maxdepth 1 -name '*.jsonl' 2>/dev/null | head -1); [ -n "$f" ] || continue
+    cwd=$(grep -ahm1 '"cwd":' "$f" 2>/dev/null | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p')
+    [ -n "$cwd" ] || continue
+    case "$cwd" in /private/var/*|/tmp/*|/private/tmp/*|/var/folders/*) continue ;; esac
+    dirname "$cwd" >> "$_t"
+  done
+  if [ -s "$_t" ]; then
+    echo "  bovenliggende mappen, meest gebruikt eerst:"
+    sort "$_t" | uniq -c | sort -rn | head -5 | sed 's/^/   /'
+    SUGGEST=$(sort "$_t" | uniq -c | sort -rn | head -1 | sed 's/^ *[0-9]* *//')
+    [ "$SUGGEST" = "$CODE" ] && SUGGEST=""
+  else
+    echo "  geen bruikbare paden in je historie gevonden"
+  fi
+  rm -f "$_t"
+fi
+echo
+
 echo "=== 6. koppeling project -> historie (dit is wat cx doet) ==="
 hit=0; miss=0; shown=0
 [ -d "$CODE" ] && for dir in "$CODE"/*/; do
@@ -103,13 +127,25 @@ if [ "$V_HIST" = 1 ]; then
   found=1
 fi
 if [ "$V_CODE" = 1 ]; then
-  echo "* OORZAAK: $CODE bestaat niet. cx kijkt alleen daar. Wijs het naar je eigen map:"
-  echo "    echo 'export CX_CODE_DIR=\"\$HOME/jouw-map\"' >> ~/.zshrc && exec zsh"
+  echo "* OORZAAK: $CODE bestaat niet. cx kijkt alleen daar."
+  if [ -n "$SUGGEST" ]; then
+    echo "  Volgens je historie (zie 5b) werk je vooral hier: $SUGGEST"
+    echo "    echo 'export CX_CODE_DIR=\"$SUGGEST\"' >> ~/.zshrc && exec zsh"
+  else
+    echo "    echo 'export CX_CODE_DIR=\"\$HOME/jouw-map\"' >> ~/.zshrc && exec zsh"
+  fi
   found=1
 fi
 if [ "$V_LINK" = 1 ] && [ "$V_CODE" = 0 ] && [ "$V_STAT" = 0 ]; then
-  echo "* OORZAAK: geen enkel project in $CODE heeft een historiemap. Je hebt daar dus"
-  echo "  nog nooit 'claude' gedraaid, of je draait het vanuit een andere map."
+  echo "* OORZAAK: geen enkel project in $CODE heeft een historiemap. Je draait"
+  echo "  'claude' dus vanuit een andere map dan waar cx kijkt."
+  if [ -n "$SUGGEST" ]; then
+    echo "  Volgens je historie (zie 5b) werk je vooral hier: $SUGGEST"
+    echo "  Wijs cx daarheen:"
+    echo "    echo 'export CX_CODE_DIR=\"$SUGGEST\"' >> ~/.zshrc && exec zsh"
+  else
+    echo "  Zet CX_CODE_DIR naar de map waar je projecten staan (zie 5b)."
+  fi
   found=1
 fi
 if [ "$V_ENC" = 1 ]; then

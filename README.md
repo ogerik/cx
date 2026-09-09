@@ -67,11 +67,44 @@ Uit te zetten met `CX_RECAP=0`.
 ## Installatie
 
 ```sh
-git clone https://github.com/ogerik/cx.git ~/code/cx
-~/code/cx/install.sh
+git clone https://github.com/ogerik/cx.git ~/code/cx && ~/code/cx/install.sh
 ```
 
-Het install-script zet een symlink in `~/.local/bin/cx` (zorg dat die map in je `PATH` staat) en controleert de afhankelijkheden.
+Daarna werkt `cx` overal in je shell. Het install-script zet een symlink
+`~/.local/bin/cx` naar de gekloonde map, maakt de scripts in `bin/` uitvoerbaar en
+controleert de afhankelijkheden. De repo blijft dus staan waar je hem kloont — verplaats
+of verwijder hem niet, of draai `install.sh` daarna opnieuw.
+
+**Staat `~/.local/bin` niet in je `PATH`?** Het install-script zegt het als dat zo is.
+Toevoegen:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && exec zsh
+```
+
+**Ergens anders installeren** (bijvoorbeeld in `/usr/local/bin`, voor alle gebruikers):
+
+```sh
+CX_BIN_DIR=/usr/local/bin ~/code/cx/install.sh
+```
+
+**Bijwerken:**
+
+```sh
+git -C ~/code/cx pull
+```
+
+De symlink wijst naar de repo, dus een `pull` is genoeg; `install.sh` opnieuw draaien
+hoeft alleen als je de doelmap wilt wijzigen.
+
+**Verwijderen:**
+
+```sh
+rm ~/.local/bin/cx && rm -rf ~/code/cx
+```
+
+Je sessie-historie blijft daarbij intact: die is van Claude Code zelf en staat in
+`~/.claude/projects`. Alleen `~/.claude/cx-favorites` blijft als los bestandje achter.
 
 ### Afhankelijkheden
 

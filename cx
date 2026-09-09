@@ -11,7 +11,7 @@
 
 set -uo pipefail
 
-CX_VERSION="1.5.0"
+CX_VERSION="1.6.0"
 
 CODE="${CX_CODE_DIR:-$HOME/code}"
 PROJ="$HOME/.claude/projects"
@@ -43,6 +43,7 @@ cx_self() {
   cd -P "$(dirname "$src")" && pwd
 }
 CX_DIR="$(cx_self)"
+CX_SELF="${CX_SELF:-$CX_DIR/cx}"
 ARGSBIN="$CX_DIR/bin/claude-session-args"
 [ -x "$ARGSBIN" ] || ARGSBIN="$HOME/.claude/bin/claude-session-args"
 
@@ -372,10 +373,105 @@ cmd_preview() {
 
 # --- modi ------------------------------------------------------------------
 
+# Waar werk je volgens je historie? Leidt uit de cwd's in ~/.claude/projects de
+# meest gebruikte bovenliggende map af. Alleen nodig als $CODE niets oplevert,
+# dus de kosten hiervan vallen buiten het normale opstarten.
+suggest_codedir() {
+  local d f cwd tmp out
+  [ -d "$PROJ" ] || return 0
+  tmp=$(mktemp)
+  for d in "$PROJ"/*/; do
+    [ -d "$d" ] || continue
+    f=$(find "$d" -maxdepth 1 -name '*.jsonl' 2>/dev/null | head -1)
+    [ -n "$f" ] || continue
+    cwd=$(session_cwd "$f")
+    [ -n "$cwd" ] || continue
+    case "$cwd" in /private/var/*|/var/folders/*|/tmp/*|/private/tmp/*) continue ;; esac
+    dirname "$cwd" >> "$tmp"
+  done
+  out=$(sort "$tmp" | uniq -c | sort -rn | head -1 | sed 's/^ *[0-9]* *//')
+  rm -f "$tmp"
+  [ "$out" = "$CODE" ] && return 0
+  [ -d "$out" ] && printf '%s' "$out"
+}
+
+# Uitleg als er niets te tonen valt. Een lege lijst zonder tekst laat je raden;
+# meestal staan de projecten simpelweg ergens anders dan in $CODE.
+hint_empty() {
+  local why="$1" sug
+  echo
+  echo "${C_BOLD}cx: $why${C_OFF}"
+  echo
+  sug=$(suggest_codedir)
+  if [ -n "$sug" ]; then
+    echo "Volgens je Claude Code-historie werk je vooral hier:"
+    echo "  ${C_CY}$sug${C_OFF}"
+    echo
+    echo "Wijs cx daarheen:"
+    echo "  ${C_BOLD}echo 'export CX_CODE_DIR=\"$sug\"' >> ~/.zshrc && exec zsh${C_OFF}"
+  else
+    echo "cx kijkt in ${C_CY}$CODE${C_OFF}. Staan je projecten ergens anders, zet dan:"
+    echo "  ${C_BOLD}echo 'export CX_CODE_DIR=\"\$HOME/jouw-map\"' >> ~/.zshrc && exec zsh${C_OFF}"
+  fi
+  echo
+  echo "${C_DIM}Uitgebreide diagnose: $CX_DIR/doctor.sh${C_OFF}"
+  echo
+}
+
+# Eén regel voor het projectoverzicht. Draait ook als losse `cx _row <map>...`
+# in een parallelle worker, vandaar dat 'hier' via CX_HERE binnenkomt.
+# velden: here \t fav \t mtime \t proj \t file \t weergave
+project_row() {
+  local dir="$1" proj hist line mtime file label rt gcol gc p_gcol p_rt fav here star
+  proj=$(basename "$dir")
+  [ "$proj" = ".claude" ] && return 0
+  hist=$(hist_dir_for "${dir%/}")
+  line=$(latest_session "$hist")
+  if [ -n "$line" ]; then
+    mtime=${line%% *}; file=${line#* }
+    label=$(session_label "$file"); rt=$(reltime "$mtime")
+  else
+    mtime=0; file=""; rt="—"; label="(geen sessies)"
+  fi
+  gcol=$(git_col "${dir%/}")
+  case "$gcol" in *\*) gc="$C_DIRTY" ;; "") gc="" ;; *) gc="$C_OK" ;; esac
+  p_gcol=$(printf '%-14s' "$gcol"); [ -n "$gc" ] && p_gcol="${gc}${p_gcol}${C_OFF}"
+  p_rt=$(printf '%-11s' "$rt"); p_rt="${C_DIM}${p_rt}${C_OFF}"
+  if is_fav "$proj"; then fav=1; else fav=0; fi
+  if [ -n "${CX_HERE:-}" ] && [ "$proj" = "$CX_HERE" ]; then here=1; else here=0; fi
+  # markering: 'hier' (▸) wint van favoriet (★); anders een spatie zodat de
+  # kolom even breed blijft en de projectnamen uitgelijnd staan
+  if   [ "$here" = 1 ]; then star="${C_CY}▸${C_OFF}"
+  elif [ "$fav"  = 1 ]; then star="${C_STAR}★${C_OFF}"
+  else                       star=" "
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s %-20s %s %s %s\n' \
+    "$here" "$fav" "$mtime" "$proj" "$file" "$star" "$proj" "$p_gcol" "$p_rt" "$label"
+}
+
+# Alle projectrijen onder een map, parallel. Valt terug op serieel als xargs
+# geen -P kent. Werkt met NUL-scheiding, zodat mappen met spaties heel blijven.
+project_rows() {
+  local code="$1" par n=0 dir
+  par="${CX_JOBS:-$(command sysctl -n hw.ncpu 2>/dev/null || command nproc 2>/dev/null || echo 4)}"
+  [ "$par" -gt 12 ] 2>/dev/null && par=12
+  for dir in "$code"/*/; do [ -d "$dir" ] && n=$((n+1)); done
+  [ "$n" = 0 ] && return 0
+  # Serieel als parallel niet kan of niet loont: te weinig projecten, geen
+  # xargs -P, of we kunnen onszelf niet aanroepen. Nooit stil niets teruggeven.
+  if [ "$n" -lt 8 ] || [ ! -x "$CX_SELF" ] \
+     || ! printf '' | xargs -0 -P "$par" -n 1 true 2>/dev/null; then
+    for dir in "$code"/*/; do [ -d "$dir" ] && project_row "${dir%/}"; done
+    return 0
+  fi
+  for dir in "$code"/*/; do [ -d "$dir" ] && printf '%s\0' "${dir%/}"; done \
+    | xargs -0 -P "$par" -n 8 "$CX_SELF" _row
+}
+
 cmd_projects() {
   need_fzf
   local tmp dir proj hist line mtime file label rt gcol gc p_gcol p_rt star fav here out rc key sel
-  local here_proj pwdreal codereal rest
+  local here_proj pwdreal codereal rest hint sug
 
   # Welk project is de huidige werkmap? Submappen en worktrees ónder een
   # projectmap tellen mee: we nemen het eerste padsegment onder $CODE. Zit je
@@ -392,39 +488,38 @@ cmd_projects() {
 
   while true; do
     tmp=$(mktemp)
-    for dir in "$CODE"/*/; do
-      proj=$(basename "$dir")
-      [ "$proj" = ".claude" ] && continue
-      hist=$(hist_dir_for "${dir%/}")
-      line=$(latest_session "$hist")
-      if [ -n "$line" ]; then
-        mtime=${line%% *}; file=${line#* }
-        label=$(session_label "$file"); rt=$(reltime "$mtime")
+    # De rijen parallel opbouwen: per project kost `git status` en het lezen van
+    # de sessietitel tientallen milliseconden, en dat telt bij honderd projecten
+    # op tot seconden. xargs start een handvol workers die elk een groepje
+    # projecten doen; de volgorde die daaruit rolt maakt niet uit, want er wordt
+    # hierna toch gesorteerd.
+    CX_HERE="$here_proj" project_rows "$CODE" > "$tmp"
+
+    # Niets gevonden: zeg waaróm, in plaats van een lege picker te openen.
+    if [ ! -s "$tmp" ]; then
+      rm -f "$tmp"
+      if [ -d "$CODE" ]; then hint_empty "geen projectmappen in $CODE"
+      else                    hint_empty "$CODE bestaat niet"
+      fi
+      return 1
+    fi
+    # Wel mappen, maar nergens historie: bijna altijd de verkeerde $CODE.
+    hint=""
+    if ! cut -f5 "$tmp" | grep -q .; then
+      hint=$'\n'"geen van deze projecten heeft Claude Code-historie"
+      sug=$(suggest_codedir)
+      if [ -n "$sug" ]; then
+        hint="$hint"$'\n'"volgens je historie werk je in $sug — zet CX_CODE_DIR daarheen"
       else
-        mtime=0; file=""; rt="—"; label="(geen sessies)"
+        hint="$hint"$'\n'"draai $CX_DIR/doctor.sh voor een diagnose"
       fi
-      gcol=$(git_col "${dir%/}")
-      case "$gcol" in *\*) gc="$C_DIRTY" ;; "") gc="" ;; *) gc="$C_OK" ;; esac
-      p_gcol=$(printf '%-14s' "$gcol"); [ -n "$gc" ] && p_gcol="${gc}${p_gcol}${C_OFF}"
-      p_rt=$(printf '%-11s' "$rt"); p_rt="${C_DIM}${p_rt}${C_OFF}"
-      if is_fav "$proj"; then fav=1; else fav=0; fi
-      if [ -n "$here_proj" ] && [ "$proj" = "$here_proj" ]; then here=1; else here=0; fi
-      # markering: 'hier' (▸) wint van favoriet (★); anders een spatie zodat de
-      # kolom even breed blijft en de projectnamen uitgelijnd staan
-      if   [ "$here" = 1 ]; then star="${C_CY}▸${C_OFF}"
-      elif [ "$fav"  = 1 ]; then star="${C_STAR}★${C_OFF}"
-      else                       star=" "
-      fi
-      # velden: here \t fav \t mtime \t proj \t file \t weergave
-      printf '%s\t%s\t%s\t%s\t%s\t%s %-20s %s %s %s\n' \
-        "$here" "$fav" "$mtime" "$proj" "$file" "$star" "$proj" "$p_gcol" "$p_rt" "$label" >> "$tmp"
-    done
+    fi
 
     out=$(sort -t$'\t' -k1,1nr -k2,2nr -k3,3nr "$tmp" | cut -f4- \
       | fzf --ansi --delimiter='\t' --with-nth=3 --expect=ctrl-n \
             --prompt='project> ' \
             --preview='cx _preview {2}' --preview-window='down:45%:wrap' \
-            --header='enter = sessies · ctrl-n = nieuwe sessie · ▸ hier · ★ favoriet · esc = stop')
+            --header="enter = sessies · ctrl-n = nieuwe sessie · ▸ hier · ★ favoriet · esc = stop$hint")
     rc=$?
     rm -f "$tmp"
     [ "$rc" -ge 130 ] && return 0            # esc/ctrl-c = stop
@@ -855,6 +950,8 @@ Instellingen (env-vars, bijv. in ~/.zshrc):
                           (0 = uit; ook automatisch uit als de output geen terminal is)
   CX_SESSION_COLOR=1      elke sessie een eigen prompt-bar kleur, zodat je met
                           meerdere tabs open ziet welke welke is (0 = uit)
+  CX_JOBS=<n>             hoeveel projecten cx tegelijk uitleest bij het opbouwen
+                          van het overzicht (default: aantal cores, max 12)
 
 Puur lokaal: leest je bestaande ~/.claude/projects historie en start de
 claude CLI. Geen API, geen achtergrondproces.
@@ -899,6 +996,7 @@ case "${1:-}" in
   pin)           shift; cmd_pin "${1:-}" ;;
   unpin)         shift; cmd_unpin "${1:-}" ;;
   _preview)      shift; cmd_preview "${1:-}" ;;
+  _row)          shift; for _d in "$@"; do project_row "$_d"; done ;;
   _sessions)     shift; p=$(canon_proj "${1:?gebruik: cx _sessions <project>}") \
                    || { echo "cx: geen project '$1' onder $CODE"; exit 1; }
                  project_sessions "$CODE/$p" | sort -t$'\t' -k1,1 -rn ;;

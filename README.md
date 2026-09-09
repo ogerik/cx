@@ -126,7 +126,8 @@ Of, als je de repo al hebt: `~/code/cx/doctor.sh`.
 
 Twee veelvoorkomende oorzaken die de diagnose vindt:
 
-- **Je projecten staan niet in `~/code`.** Zet `CX_CODE_DIR` naar je eigen map.
+- **Je projecten staan niet in `~/code`.** Zet `CX_CODE_DIR` naar je eigen map. `cx`
+  zegt dit sinds 1.6.0 ook zelf, met de juiste map er al bij ingevuld.
 - **Je draait Linux of WSL.** `cx` leest tijdstempels met de macOS-vorm van `stat`;
   op Linux vindt het daardoor geen sessies. Nog niet opgelost.
 
@@ -143,6 +144,7 @@ Te overschrijven via env-vars, bijvoorbeeld in je `~/.zshrc`:
 | `CX_RECAP` | `1` | Recap-card tonen vóór het openen van een sessie (`0` = uit). |
 | `CX_ANIM` | `1` | Subtiele animaties: spinners bij wachten, recap-intro, sweeps (`0` = uit; ook automatisch uit als de output geen terminal is). |
 | `CX_SESSION_COLOR` | `1` | Elke sessie krijgt een eigen prompt-bar kleur, per project (`0` = uit). |
+| `CX_JOBS` | aantal cores (max 12) | Hoeveel projecten `cx` tegelijk uitleest bij het opbouwen van het overzicht. |
 
 Bekijk alle animaties in één keer met `cx _animdemo`.
 
@@ -181,6 +183,14 @@ claude() {
 ```
 
 ## Hoe het werkt
+
+Per project moet `cx` drie dingen weten: de git-branch, of er ongecommitte wijzigingen
+zijn, en de titel van de laatste sessie. Dat is een `git status` en het lezen van een
+sessiebestand per project — tientallen milliseconden elk, wat bij honderd projecten
+oploopt tot seconden. `cx` bouwt die regels daarom parallel op, in zoveel workers als je
+cores hebt (max 12, te sturen met `CX_JOBS`). Bij minder dan acht projecten, of als
+`xargs -P` ontbreekt, gebeurt het gewoon serieel.
+
 
 Claude Code bewaart per werkmap een sessie-historie in `~/.claude/projects/<gecodeerd-pad>/`, als `.jsonl`-bestanden. `cx` leest die bestanden om labels, tijden en previews te tonen, en roept vervolgens gewoon `claude` aan in de juiste map met de juiste vlaggen. Niets meer.
 

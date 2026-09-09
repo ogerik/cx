@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# claude-session-args — bepaalt de extra argumenten waarmee een Claude Code
+# sessie herkenbaar start: een eigen sessie-id, een badge-naam en een kleur.
+#
+#   claude-session-args "$@"     print de extra argumenten, één per regel
+#
+# Geeft niets terug als injecteren niet veilig is (headless, al een sessie-id
+# meegegeven, binnen een lopende sessie, ...). De aanroeper plakt de regels
+# achter de oorspronkelijke argumenten; de laatste regel kan een prompt zijn
+# ("/color <kleur>") en moet dus achteraan blijven.
+#
+# De naam op het promptvak komt van Claude Code zelf en wordt hier bewust niet
+# gezet, zie de opmerking verderop.
+#
+# Wordt gebruikt door cx, en desgewenst door een eigen zsh-wrapper rond
+# `claude`, zodat beide precies hetzelfde doen. Zie de README van cx.
+#
+# Uitschakelbaar via env: CLAUDE_SESSION_ARGS=0 (alles) of
+# CLAUDE_SESSION_COLOR=0 (alleen de kleur).
+
+set -uo pipefail
+
+# session-color staat naast dit script (in de cx-repo of in ~/.claude/bin);
+# val terug op ~/.claude/bin voor wie alleen dat pad heeft.
+SELFDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+COLORBIN="${SELFDIR:-.}/session-color"
+[ -x "$COLORBIN" ] || COLORBIN="$HOME/.claude/bin/session-color"
+
+# Binnen een lopende sessie (subagents, `claude` vanuit Claude) niets doen.
+[ -n "${CLAUDECODE:-}" ] && exit 0
+[ "${CLAUDE_SESSION_ARGS:-1}" = "0" ] && exit 0
+
+sid=""            # sessie-id waar we een kleur aan hangen
+want_new_id=1     # zelf een id verzinnen?
+have_prompt=0     # gebruiker gaf al een prompt mee
+have_name=0
+skip=0
+
+# Argumenten aftasten. Alles wat een waarde neemt slaan we over, zodat de
+# waarde niet per ongeluk als prompt wordt gelezen.
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    --resume|-r) sid="$a"; want_new_id=0; prev=""; continue ;;
+    --session-id|--name|-n|--model|--agent|--append-system-prompt|--settings|--add-dir|--permission-mode|--allowed-tools|--disallowed-tools|--mcp-config|--cloud)
+      prev=""; continue ;;
+  esac
+  case "$a" in
+    # Headless of niet-interactief: handen af.
+    -p|--print|--version|-v|--help|-h|--mcp|--doctor|--update|--install) skip=1 ;;
+    # Gebruiker regelt het zelf al.
+    --session-id) want_new_id=0; skip=1 ;;
+    --name|-n) have_name=1; prev="$a" ;;
+    # Hervatten zonder id: we weten niet welke sessie het wordt.
+    --continue|-c) skip=1 ;;
+    --resume|-r) prev="$a" ;;
+    -*) prev="$a" ;;
+    *) have_prompt=1 ;;
+  esac
+done
+
+[ "$skip" = "1" ] && exit 0
+
+if [ "$want_new_id" = "1" ]; then
+  sid=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z')
+fi
+[ -n "$sid" ] || exit 0
+
+# Bewust géén --name: de badge op het promptvak is `customTitle ?? aiTitle`, en
+# Claude Code werkt die aiTitle tijdens het gesprek zelf bij. Zodra we hier een
+# naam meegeven zetten we een customTitle en staat de badge voorgoed stil.
+# /rename blijft gewoon werken als je hem zelf wilt vastzetten.
+
+# --- uitvoer ---------------------------------------------------------------
+[ "$want_new_id" = "1" ] && { printf -- '--session-id\n'; printf '%s\n' "$sid"; }
+
+if [ "$have_prompt" = "0" ] && [ "${CLAUDE_SESSION_COLOR:-1}" != "0" ] && [ -x "$COLORBIN" ]; then
+  col=$("$COLORBIN" "$sid" "$PWD" 2>/dev/null)
+  [ -n "$col" ] && printf '/color %s\n' "$col"
+fi
+
+exit 0

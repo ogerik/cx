@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# session-color — geeft elk project een eigen kleur, en daarmee elke tab.
+#
+#   session-color <sessie-id> [map]     kleurnaam voor deze sessie
+#   session-color --resolve <id> [map]  idem, maar ruimt botsingen op
+#   session-color --ansi <naam>         ANSI-code voor een kleurnaam
+#   session-color --list                overzicht van open projecten en sessies
+#
+# De kleur hangt aan het project, niet aan de sessie: hetzelfde project is
+# altijd dezelfde kleur. Twee tabs in hetzelfde project delen dus een kleur,
+# en de naam op het promptvak zegt welke van de twee je voor je hebt.
+#
+# Het project is de git-root van je werkmap (anders de map zelf), zodat het niet
+# uitmaakt of je claude in een submap start. Kleuren worden pas uitgedeeld als
+# een project voor het eerst opengaat, en blijven daarna staan.
+#
+# Zet CLAUDE_SESSION_COLOR_MODE=session voor een kleur per tab in plaats van
+# per project.
+#
+# Wordt aangeroepen door claude-session-args (bij het starten) en door de
+# statusline (elke render), dus: geen netwerk, geen jq, snel falen.
+
+set -uo pipefail
+
+DIR="$HOME/.claude/session-colors"
+PDIR="$HOME/.claude/project-colors"
+PROJ="$HOME/.claude/projects"
+# Claude Code houdt hier per draaiend proces een bestandje bij: het meest
+# betrouwbare antwoord op "welke tabs staan er nu open".
+ROSTER="$HOME/.claude/sessions"
+
+# Volgorde is de voorkeursvolgorde bij het uitdelen.
+COLORS=(blue green orange purple cyan yellow pink red)
+
+MODE="${CLAUDE_SESSION_COLOR_MODE:-project}"
+
+# Minuten dat een sessie zonder transcript-activiteit nog als "open" telt.
+LIVE_MIN="${CX_COLOR_LIVE_MIN:-90}"
+# De statusline tikt het claim-bestand aan bij elke render, dus een verse claim
+# betekent "deze tab staat nu open".
+CLAIM_MIN="${CX_COLOR_CLAIM_MIN:-20}"
+
+ansi_for() {
+  case "$1" in
+    red)    printf '31'      ;;
+    green)  printf '32'      ;;
+    yellow) printf '33'      ;;
+    blue)   printf '34'      ;;
+    purple) printf '35'      ;;
+    cyan)   printf '36'      ;;
+    orange) printf '38;5;208';;
+    pink)   printf '38;5;213';;
+    *)      printf '37'      ;;
+  esac
+}
+
+# --- projecten -------------------------------------------------------------
+
+# Sleutel voor een map: de git-root als die er is, anders de map zelf. Slashes
+# worden streepjes zodat het een bestandsnaam kan zijn.
+project_key() {
+  local d="${1:-$PWD}" root
+  root=$(git -C "$d" --no-optional-locks rev-parse --show-toplevel 2>/dev/null)
+  [ -n "$root" ] || root="$d"
+  printf '%s' "${root//\//-}"
+}
+
+# Projecten waar op dit moment een tab van openstaat, als "sleutel<tab>pad".
+# Het pad houden we erbij omdat je uit de sleutel niet kunt terugrekenen welke
+# streepjes mappen scheidden en welke in een mapnaam zaten.
+open_projects() {
+  local f cwd root pid
+  for f in "$ROSTER"/*.json; do
+    [ -f "$f" ] || continue
+    # Bestandsnaam is de pid; van een proces dat niet meer draait is de tab weg
+    # en mag de kleur weer vrij.
+    pid=$(basename "$f" .json)
+    kill -0 "$pid" 2>/dev/null || continue
+    cwd=$(sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p' "$f" 2>/dev/null)
+    [ -n "$cwd" ] || continue
+    root=$(git -C "$cwd" --no-optional-locks rev-parse --show-toplevel 2>/dev/null)
+    [ -n "$root" ] || root="$cwd"
+    printf '%s\t%s\n' "${root//\//-}" "$root"
+  done
+}
+
+open_project_keys() { open_projects | cut -f1; }
+
+# --- sessies ---------------------------------------------------------------
+
+# Pad van het transcript van een sessie (leeg als het er niet is). Sessies
+# kunnen in elke projectmap staan, dus glob over alle projecten.
+transcript_for() {
+  local f
+  for f in "$PROJ"/*/"$1".jsonl; do
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+# Leeft deze sessie nog? In volgorde van betrouwbaarheid:
+#   1. hij staat in het proces-register dat Claude Code zelf bijhoudt
+#   2. de claim is vers (sessie is net gestart, of statusline rendert nog)
+#   3. het transcript is recent aangeraakt
+is_live() {
+  local sid="$1" f="$DIR/$1" t
+  grep -lq "\"$sid\"" "$ROSTER"/*.json 2>/dev/null && return 0
+  [ -n "$(find "$f" -newermt "-${CLAIM_MIN} minutes" -print -quit 2>/dev/null)" ] && return 0
+  t=$(transcript_for "$sid") || return 1
+  [ -n "$(find "$t" -newermt "-${LIVE_MIN} minutes" -print -quit 2>/dev/null)" ]
+}
+
+# --- kleur kiezen ----------------------------------------------------------
+# Bash 3.2 (de macOS-versie) kent geen associatieve arrays, dus tellen we in
+# een simpele string met kleurnamen.
+
+least_used() {
+  local used="$1" c n best="" bestn=-1
+  for c in "${COLORS[@]}"; do
+    n=$(printf '%s\n' $used | grep -cx -- "$c")
+    if [ "$bestn" -lt 0 ] || [ "$n" -lt "$bestn" ]; then best="$c"; bestn="$n"; fi
+  done
+  printf '%s' "$best"
+}
+
+# Kleur die het minst in gebruik is bij de projecten die nu openstaan. Een
+# project dat net een kleur kreeg telt ook mee: bij het starten staat de tab nog
+# niet in het register, en zonder dat zouden twee tegelijk geopende projecten
+# dezelfde kleur pakken.
+pick_project_color() {
+  local me="$1" f key col used="" openkeys
+  openkeys=$(open_project_keys)
+  for f in "$PDIR"/*; do
+    [ -f "$f" ] || continue
+    key=$(basename "$f")
+    [ "$key" = "$me" ] && continue
+    if printf '%s\n' "$openkeys" | grep -qxF -- "$key" \
+       || [ -n "$(find "$f" -newermt "-${CLAIM_MIN} minutes" -print -quit 2>/dev/null)" ]; then
+      col=$(cat "$f" 2>/dev/null)
+      [ -n "$col" ] && used="$used $col"
+    fi
+  done
+  least_used "$used"
+}
+
+# Kleur die het minst in gebruik is bij de sessies die nu openstaan.
+pick_session_color() {
+  local me="$1" f sid col used=""
+  for f in "$DIR"/*; do
+    [ -f "$f" ] || continue
+    sid=$(basename "$f")
+    [ "$sid" = "$me" ] && continue
+    if ! is_live "$sid"; then
+      [ -n "$(find "$f" ! -newermt '-1 day' -print -quit 2>/dev/null)" ] && rm -f "$f"
+      continue
+    fi
+    col=$(cat "$f" 2>/dev/null)
+    [ -n "$col" ] && used="$used $col"
+  done
+  least_used "$used"
+}
+
+claim() {
+  local sid="$1" dir="${2:-$PWD}" key col
+  [ -n "$sid" ] || return 1
+  mkdir -p "$DIR" "$PDIR" 2>/dev/null
+
+  if [ "$MODE" = "session" ]; then
+    if [ -s "$DIR/$sid" ]; then cat "$DIR/$sid"; return 0; fi
+    col=$(pick_session_color "$sid")
+  else
+    key=$(project_key "$dir")
+    col=$(cat "$PDIR/$key" 2>/dev/null)
+    if [ -z "$col" ]; then
+      col=$(pick_project_color "$key")
+      printf '%s' "$col" > "$PDIR/$key" 2>/dev/null
+    fi
+  fi
+
+  printf '%s' "$col" > "$DIR/$sid" 2>/dev/null
+  printf '%s' "$col"
+}
+
+# Twee dingen met dezelfde kleur kan ontstaan als ze vrijwel tegelijk starten.
+# Wie de kleinste sleutel heeft houdt de kleur, de ander pakt een nieuwe. Beide
+# kanten komen zo tot hetzelfde antwoord, zonder afspraak en zonder op
+# tijdstempels te leunen.
+resolve() {
+  local sid="$1" dir="${2:-$PWD}" mine key other f
+
+  if [ "$MODE" != "session" ]; then
+    key=$(project_key "$dir")
+    mine=$(cat "$PDIR/$key" 2>/dev/null)
+    [ -n "$mine" ] || { claim "$sid" "$dir"; return; }
+    while IFS= read -r other; do
+      [ -n "$other" ] || continue
+      [ "$other" = "$key" ] && continue
+      [ "$(cat "$PDIR/$other" 2>/dev/null)" = "$mine" ] || continue
+      if [ "$key" \> "$other" ]; then
+        rm -f "$PDIR/$key"
+        claim "$sid" "$dir"
+        return
+      fi
+    done < <(open_project_keys)
+    # Sessie-claim gelijk houden met het project, voor --list en de statusline.
+    printf '%s' "$mine" > "$DIR/$sid" 2>/dev/null
+    printf '%s' "$mine"
+    return
+  fi
+
+  mine=$(cat "$DIR/$sid" 2>/dev/null)
+  [ -n "$mine" ] || { claim "$sid" "$dir"; return; }
+  for f in "$DIR"/*; do
+    [ -f "$f" ] || continue
+    other=$(basename "$f")
+    [ "$other" = "$sid" ] && continue
+    [ "$(cat "$f" 2>/dev/null)" = "$mine" ] || continue
+    is_live "$other" || continue
+    if [ "$sid" \> "$other" ]; then
+      rm -f "$DIR/$sid"
+      claim "$sid" "$dir"
+      return
+    fi
+  done
+  printf '%s' "$mine"
+}
+
+# Gesourcet (door de statusline) alleen de functies leveren, geen CLI draaien.
+[ "${BASH_SOURCE[0]}" != "${0}" ] && return 0
+
+case "${1:-}" in
+  --ansi)    ansi_for "${2:-}" ;;
+  --resolve) resolve "${2:-}" "${3:-$PWD}" ;;
+  --list)
+    printf 'projecten met een open tab:\n'
+    while IFS=$'\t' read -r key path; do
+      [ -n "$key" ] || continue
+      printf '  %-8s %s\n' "$(cat "$PDIR/$key" 2>/dev/null)" "$path"
+    done < <(open_projects | sort -u)
+    printf 'open sessies:\n'
+    for f in "$DIR"/*; do
+      [ -f "$f" ] || continue
+      sid=$(basename "$f")
+      is_live "$sid" && printf '  %-8s %s\n' "$(cat "$f")" "$sid"
+    done
+    ;;
+  --help|-h|"") printf 'gebruik: session-color <sessie-id> [map] | --resolve <id> [map] | --ansi <kleur> | --list\n' ;;
+  *) claim "$1" "${2:-$PWD}" ;;
+esac
+exit 0

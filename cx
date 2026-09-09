@@ -1,0 +1,924 @@
+#!/usr/bin/env bash
+# cx — Claude Code project & sessie launcher (puur lokaal, roept alleen `claude` aan)
+#
+#   cx              overzicht van je projecten onder ~/code, kies er een ->
+#                   drill-in naar de sessies van dat project
+#   cx sessions [p] alle recente sessies over alle projecten heen, of van één project
+#   cx new [naam]   maak een nieuw project ~/code/<naam> en start claude
+#   cx help         deze uitleg
+#
+# Leest alleen je bestaande ~/.claude/projects/ historie. Geen API, geen daemon.
+
+set -uo pipefail
+
+CX_VERSION="1.5.0"
+
+CODE="${CX_CODE_DIR:-$HOME/code}"
+PROJ="$HOME/.claude/projects"
+
+# --- instellingen (overschrijfbaar via env, bijv. in ~/.zshrc) -------------
+# CX_SKIP_PERMISSIONS=1  -> start claude altijd met --dangerously-skip-permissions (0 = uit)
+# (de naam op het promptvak zet Claude Code zelf, die beweegt mee met het gesprek)
+# CX_COLOR=1             -> kleur in lijsten, preview en recap-card (0 = uit)
+# CX_RECAP=1             -> recap-card tonen vóór het openen van een sessie (0 = uit)
+# CX_ANIM=1              -> subtiele terminal-animaties (0 = uit; ook uit als geen tty)
+# CX_SESSION_COLOR=1     -> elke sessie krijgt een eigen prompt-bar kleur (0 = uit)
+CX_SKIP_PERMISSIONS="${CX_SKIP_PERMISSIONS:-1}"
+CX_COLOR="${CX_COLOR:-1}"
+CX_RECAP="${CX_RECAP:-1}"
+CX_ANIM="${CX_ANIM:-1}"
+CX_SESSION_COLOR="${CX_SESSION_COLOR:-1}"
+
+# Bepaalt sessie-id en kleur van een nieuwe sessie. Ligt in bin/ naast dit
+# script; cx wordt meestal als symlink geïnstalleerd, dus het echte pad eerst
+# uitlezen. Val terug op ~/.claude/bin, zodat een eigen zsh-wrapper rond
+# `claude` precies dezelfde sessie oplevert.
+cx_self() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+CX_DIR="$(cx_self)"
+ARGSBIN="$CX_DIR/bin/claude-session-args"
+[ -x "$ARGSBIN" ] || ARGSBIN="$HOME/.claude/bin/claude-session-args"
+
+# Kleurcodes (leeg bij CX_COLOR=0). Velden altijd éérst padden en dan pas
+# kleuren: escapecodes tellen anders mee in printf-veldbreedtes.
+if [ "$CX_COLOR" = "1" ]; then
+  C_STAR=$'\033[33m'; C_OK=$'\033[32m'; C_DIRTY=$'\033[31m'
+  C_DIM=$'\033[2m'; C_CY=$'\033[36m'; C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_STAR=""; C_OK=""; C_DIRTY=""; C_DIM=""; C_CY=""; C_BOLD=""; C_OFF=""
+fi
+
+# --- animatie-primitieven --------------------------------------------------
+# Alles hieronder is no-op als CX_ANIM=0 of stdout geen terminal is, zodat
+# pipes, de _-datahelpers, cron en CI nooit escapecodes of sleeps zien.
+
+anim_on() { [ "$CX_ANIM" = "1" ] && [ -t 1 ]; }
+cursor_hide() { anim_on && printf '\033[?25l'; return 0; }
+cursor_show() { anim_on && printf '\033[?25h'; return 0; }
+
+# Korte, veilige sleep (subseconden). Faalt hij, dan gewoon geen pauze.
+nap() { sleep "$1" 2>/dev/null || true; }
+
+# Spinner terwijl een achtergrondproces loopt. De caller start het werk zelf
+# (met eigen redirection) en geeft de PID; wij spinnen op stderr en laten
+# stdout en de exitcode met rust.
+#   spin_pid "<boodschap>" <pid>
+spin_pid() {
+  local msg="$1" pid="$2" frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
+  if ! anim_on; then wait "$pid" 2>/dev/null; return $?; fi
+  trap 'printf "\033[?25h" >&2' INT TERM
+  printf '\033[?25l' >&2
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$(( (i + 1) % 10 ))
+    printf '\r%s %s ' "${C_CY}${frames:$i:1}${C_OFF}" "$msg" >&2
+    nap 0.08
+  done
+  wait "$pid" 2>/dev/null; local rc=$?
+  printf '\r\033[K\033[?25h' >&2
+  trap - INT TERM
+  return "$rc"
+}
+
+# Kleur een regel kort "in" (sweep) vlak vóór de overgang naar claude. Zonder
+# animatie of kleur gewoon de kale regel; geen merkbare vertraging.
+launch_flash() {
+  local text="$1"
+  if ! anim_on || [ "$CX_COLOR" != "1" ]; then printf '%s\n' "$text"; return 0; fi
+  printf '\033[2m%s\033[0m\r' "$text"; nap 0.06
+  printf '\033[36m%s\033[0m\r' "$text"; nap 0.06
+  printf '%s\n' "$text"
+}
+
+# Korte gekleurde sweep over het woord 'cx' bij een kale aanroep.
+cx_banner() {
+  anim_on || return 0
+  local word="c x" c
+  for c in 34 36 37; do printf '\r\033[1;%sm%s\033[0m' "$c" "$word"; nap 0.05; done
+  printf '\r\033[K'
+}
+
+# Start claude met de juiste vlaggen.
+#   $1 = modus: new | resume
+#   $2 = projectnaam (voor de sessienaam)
+#   $3 = sessie-id (alleen bij resume)
+launch() {
+  local -a flags=() extra=()
+  local line
+  cursor_show    # exec vervangt het proces en laat traps niet vuren
+  [ "$CX_SKIP_PERMISSIONS" = "1" ] && flags+=(--dangerously-skip-permissions)
+  case "$1" in
+    resume)   flags+=(--resume "$3") ;;
+  esac
+
+  # Sessie-id en kleur komen uit hetzelfde script dat ook de zsh-wrapper rond
+  # `claude` gebruikt, zodat cx en een kale `claude` precies dezelfde sessie
+  # opleveren. De naam op het promptvak zet Claude Code zelf.
+  if [ -x "$ARGSBIN" ]; then
+    while IFS= read -r line; do [ -n "$line" ] && extra+=("$line"); done < <(
+      CLAUDE_SESSION_COLOR="$CX_SESSION_COLOR" \
+      "$ARGSBIN" "${flags[@]+"${flags[@]}"}" 2>/dev/null
+    )
+  fi
+
+  exec claude "${flags[@]+"${flags[@]}"}" "${extra[@]+"${extra[@]}"}"
+}
+
+# --- helpers ---------------------------------------------------------------
+
+# Map een echte map naar de Claude-historiemap (pad met / vervangen door -).
+hist_dir_for() { printf '%s/%s' "$PROJ" "${1//\//-}"; }
+
+# Recentste sessiebestand in een historiemap -> "mtime pad" (leeg als geen).
+latest_session() {
+  [ -d "$1" ] || return 0
+  find "$1" -maxdepth 1 -name '*.jsonl' -print0 2>/dev/null \
+    | xargs -0 stat -f '%m %N' 2>/dev/null | sort -rn | head -1
+}
+
+# Eerste echte gebruikersprompt uit een sessiebestand (label voor de lijst).
+first_prompt() {
+  head -n 250 "$1" 2>/dev/null | jq -r '
+    select(.type=="user")
+    | (.message.content) as $c
+    | ( if   ($c|type)=="string" then $c
+        elif ($c|type)=="array"  then ([ $c[] | select(.type=="text") | .text ] | join(" "))
+        else empty end )' 2>/dev/null \
+    | grep -vE '^[[:space:]]*<' \
+    | grep -vE '^[[:space:]]*$' \
+    | head -1 \
+    | tr '\n' ' ' \
+    | cut -c1-72
+}
+
+# Door Claude gegenereerde sessietitel; de laatste ai-title-regel wint
+# (titels worden tijdens een sessie soms bijgesteld). Leeg als er geen is.
+# Alleen kop + staart lezen (titel staat in de preamble, updates achteraan):
+# sessies kunnen tientallen MB's zijn en dit draait per lijstregel.
+# gsub strippt control-tekens: labels en de recap-card gaan (deels) rauw
+# naar de terminal.
+session_title() {
+  # de newline tussen kop en staart voorkomt dat een doormidden gevallen
+  # regel zich aaneen kan plakken tot géldige JSON met een verminkte titel
+  { head -c 100000 "$1"; printf '\n'; tail -c 100000 "$1"; } 2>/dev/null \
+    | grep -a '"ai-title"' 2>/dev/null \
+    | jq -Rr 'fromjson? | .aiTitle // empty | gsub("[[:cntrl:]]"; " ")' 2>/dev/null \
+    | tail -1
+}
+
+# Label voor een sessie: AI-titel, anders eerste prompt, anders placeholder.
+session_label() {
+  local l
+  l=$(session_title "$1")
+  [ -z "$l" ] && l=$(first_prompt "$1")
+  [ -z "$l" ] && l="(geen tekstprompt)"
+  printf '%.72s' "$l"
+}
+
+reltime() {
+  local now t d; now=$(date +%s); t="$1"; d=$(( now - t ))
+  if   (( d < 60 ));     then echo "zojuist"
+  elif (( d < 3600 ));   then echo "$(( d/60 ))m geleden"
+  elif (( d < 86400 ));  then echo "$(( d/3600 ))u geleden"
+  elif (( d < 604800 )); then echo "$(( d/86400 ))d geleden"
+  else                        echo "$(( d/604800 ))w geleden"
+  fi
+}
+
+need_fzf() { command -v fzf >/dev/null || { echo "cx: fzf is nodig (brew install fzf)"; exit 1; }; }
+
+# Kap af op n tekens met een nette … als er iets wegvalt (tekens, niet bytes:
+# zo knippen we nooit midden in een emoji of accent).
+trunc() {
+  local s="$1" n="$2"
+  if [ "${#s}" -gt "$n" ]; then printf '%s…' "${s:0:$n}"; else printf '%s' "$s"; fi
+}
+
+FAV_FILE="$HOME/.claude/cx-favorites"
+is_fav() { [ -f "$FAV_FILE" ] && grep -qxF "$1" "$FAV_FILE"; }
+
+# Korte git-kolom voor een projectmap: branch + "*" als er wijzigingen zijn.
+git_col() {
+  local d="$1" br
+  br=$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null) || { echo ""; return 0; }
+  # bij dirty éérst inkorten en dán de ster: anders valt de ster weg bij
+  # lange branchnamen en kleurt een dirty repo groen
+  if [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ]; then
+    printf '%.13s*' "$br"
+  else
+    printf '%.14s' "$br"
+  fi
+}
+
+# Eerste cwd uit een sessiebestand. Elke sessie-entry draagt zijn werkmap,
+# maar de preamble (ai-title, file-history-snapshot, ...) kan tientallen
+# regels lang zijn. Snel pad: grep pakt de eerste regel met "cwd": en jq
+# parset alleen die regel; staat de cwd daar toch niet op topniveau
+# (bijv. genest in een snapshot), dan scant jq alsnog het hele bestand.
+session_cwd() {
+  local f="$1" line cwd
+  line=$(grep -am1 '"cwd":' "$f" 2>/dev/null)
+  cwd=$(printf '%s' "$line" | jq -r '.cwd // empty' 2>/dev/null)
+  [ -z "$cwd" ] && cwd=$(jq -r 'select(.cwd) | .cwd' "$f" 2>/dev/null | head -1)
+  printf '%s\n' "$cwd"
+}
+
+# Alle sessierijen van één project, inclusief historiemappen van submappen en
+# worktrees ónder het projectpad. Kandidaten via naamprefix; lidmaatschap wordt
+# per sessiebestand beslist op de cwd uit de jsonl, want de encoding is lossy:
+# ~/code/foo/bar en buurproject ~/code/foo-bar delen dezelfde historiemap.
+# Output (ongesorteerd): mtime \t id \t cwd \t file \t rel
+# rel kan leeg zijn en staat daarom als laatste veld: een leeg middenveld
+# zou bij tab-IFS read dichtklappen en alle velden laten verschuiven.
+project_sessions() {
+  local dir="$1" enc cand cwd rel line mtime f id
+  enc=$(hist_dir_for "$dir")
+  for cand in "$enc" "$enc"-*; do
+    [ -d "$cand" ] || continue
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      mtime=${line%% *}; f=${line#* }
+      cwd=$(session_cwd "$f")
+      # geen cwd vindbaar: in de eigen historiemap nemen we de projectroot aan,
+      # in een kandidaat-map slaan we het bestand conservatief over
+      [ -z "$cwd" ] && [ "$cand" = "$enc" ] && cwd="$dir"
+      case "$cwd" in
+        "$dir") : ;;
+        "$dir"/*) : ;;
+        *) continue ;;
+      esac
+      rel="${cwd#"$dir"}"; rel="${rel#/}"
+      id=$(basename "$f" .jsonl)
+      printf '%s\t%s\t%s\t%s\t%s\n' "$mtime" "$id" "$cwd" "$f" "$rel"
+    done < <(find "$cand" -maxdepth 1 -name '*.jsonl' -print0 2>/dev/null \
+              | xargs -0 stat -f '%m %N' 2>/dev/null)
+  done
+}
+
+# Normaliseer een projectargument naar de echte mapnaam onder $CODE.
+# Vangt tab-completion-slashes, ./, .., symlinks (via pwd -P) en — APFS is
+# case-insensitief — hoofdlettertypo's af; die zouden anders naar een
+# niet-bestaande historiemap coderen en stilletjes een verse sessie starten.
+# Faalt (exit 1) als het argument geen directe projectmap onder $CODE is.
+canon_proj() {
+  local in="$1" codereal real base lower d cand
+  codereal=$(cd "$CODE" 2>/dev/null && pwd -P) || return 1
+  real=$(cd "$CODE/$in" 2>/dev/null && pwd -P) || return 1
+  base=$(basename "$real")
+  [ "$real" = "$codereal/$base" ] || return 1
+  lower=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
+  for d in "$CODE"/*/; do
+    cand=$(basename "$d")
+    if [ "$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]')" = "$lower" ]; then
+      printf '%s' "$cand"; return 0
+    fi
+  done
+  printf '%s' "$base"
+}
+
+# Recap-card vóór het openen van een sessie: waar was je, waar bleef Claude.
+# Data uit de staart van de jsonl; puur presentatie, start niets.
+recap_card() {
+  local proj="$1" f="$2" cwd="$3" title rt br q a
+  [ "$CX_RECAP" = "1" ] || return 0
+  [ -f "$f" ] || return 0
+  title=$(session_title "$f")
+  [ -z "$title" ] && title=$(first_prompt "$f" | tr -d '\000-\037')
+  rt=$(reltime "$(stat -f '%m' "$f" 2>/dev/null || echo 0)")
+  br=$(git_col "$cwd")
+  # gsub maakt van elk bericht één regel zónder control-tekens, zodat grep en
+  # tail per berícht filteren (niet per regel) en er niets naar de terminal
+  # lekt (ANSI-codes uit geciteerde terminaloutput, system-reminder-regels).
+  # Daarna gaat markdown-ruis (**, `, koppen) eruit: dit is terminaltekst.
+  q=$(tail -c 400000 "$f" 2>/dev/null | jq -Rr '
+        fromjson? | select(.type=="user") | (.message.content) as $c
+        | ( if   ($c|type)=="string" then $c
+            elif ($c|type)=="array"  then ([ $c[] | select(.type=="text") | .text ] | join(" "))
+            else empty end )
+        | gsub("[[:cntrl:]]"; " ") | gsub("\\*\\*|`"; "")
+        | gsub("^[# ]+"; "") | gsub(" +"; " ") | gsub("^ +| +$"; "")' 2>/dev/null \
+      | grep -vE '^[[:space:]]*<' | grep -vE '^[[:space:]]*$' | tail -1)
+  a=$(tail -c 400000 "$f" 2>/dev/null | jq -Rr '
+        fromjson? | select(.type=="assistant") | (.message.content) as $c
+        | ( if   ($c|type)=="array"  then ([ $c[] | select(.type=="text") | .text ] | join(" "))
+            elif ($c|type)=="string" then $c
+            else empty end )
+        | gsub("[[:cntrl:]]"; " ") | gsub("\\*\\*|`"; "")
+        | gsub("^[# ]+"; "") | gsub(" +"; " ") | gsub("^ +| +$"; "")' 2>/dev/null \
+      | grep -vE '^[[:space:]]*$' | tail -1)
+  # Regels cascaden van boven naar beneden (~35ms ertussen) als anim aan staat;
+  # anders in één keer. De balk 'groeit' zo mee met de tekst.
+  local B="${C_CY}▌${C_OFF}" d=""
+  anim_on && d="0.035"
+  printf '%s %s%s%s\n' "$B" "$C_DIM" "$proj${br:+ · $br} · $rt" "$C_OFF"; [ -n "$d" ] && nap "$d"
+  printf '%s %s%s%s\n' "$B" "$C_BOLD" "$(trunc "${title:-(zonder titel)}" 56)" "$C_OFF"; [ -n "$d" ] && nap "$d"
+  if [ -n "$q" ] || [ -n "$a" ]; then
+    printf '%s\n' "$B"; [ -n "$d" ] && nap "$d"
+    [ -n "$q" ] && { printf '%s %sJij, als laatste:%s   %s\n' "$B" "$C_CY" "$C_OFF" "$(trunc "$q" 52)"; [ -n "$d" ] && nap "$d"; }
+    [ -n "$a" ] && { printf '%s %sClaude bleef bij:%s   %s\n' "$B" "$C_DIM" "$C_OFF" "$(trunc "$a" 52)"; [ -n "$d" ] && nap "$d"; }
+  fi
+  printf '\n'
+}
+
+# Open een gekozen sessierij (velden: id \t file \t cwd \t weergave) in claude.
+open_session_row() {
+  local proj="$1" sel="$2" id f cwd
+  id=$(printf '%s' "$sel" | cut -f1)
+  f=$(printf '%s' "$sel" | cut -f2)
+  cwd=$(printf '%s' "$sel" | cut -f3)
+  if [ -d "$cwd" ]; then
+    cd "$cwd" || exit 1
+  else
+    echo "cx: $cwd bestaat niet meer, ik start vanuit $CODE/$proj"
+    cwd="$CODE/$proj"
+    cd "$cwd" || exit 1
+  fi
+  recap_card "$proj" "$f" "$cwd"
+  launch_flash "→ open sessie in $proj"
+  launch resume "$proj" "$id"
+}
+
+# Render de start van een sessie voor het fzf-previewpaneel:
+# titel + metadataregel bovenin, daaronder het gespreksbegin met sprekerkleur.
+cmd_preview() {
+  local f="${1:-}" title n rt cwd br
+  [ -f "$f" ] || { echo "(geen sessie-historie)"; return 0; }
+  title=$(session_title "$f"); [ -z "$title" ] && title=$(first_prompt "$f")
+  n=$(grep -Eac '"type":"(user|assistant)"' "$f" 2>/dev/null); [ -z "$n" ] && n=0
+  rt=$(reltime "$(stat -f '%m' "$f" 2>/dev/null || echo 0)")
+  cwd=$(session_cwd "$f"); br=""
+  [ -n "$cwd" ] && [ -d "$cwd" ] && br=$(git_col "$cwd")
+  printf '%s%s%s\n' "$C_BOLD" "${title:-(zonder titel)}" "$C_OFF"
+  printf '%s±%s berichten · %s%s%s\n' "$C_DIM" "$n" "$rt" "${br:+ · $br}" "$C_OFF"
+  head -n 600 "$f" | jq -r '
+    select(.type=="user" or .type=="assistant")
+    | (.message.role // .type) as $r
+    | (.message.content) as $c
+    | ( if   ($c|type)=="string" then $c
+        elif ($c|type)=="array"  then ([ $c[] | select(.type=="text") | .text ] | join(" "))
+        else "" end ) as $t
+    | select(($t|length) > 0 and (($t|ltrimstr(" ")|startswith("<")) | not))
+    | (if $r=="user" then "\n### " + ($t|gsub("\n";" ")) else "    " + ($t|gsub("\n";" ")) end)
+  ' 2>/dev/null | cut -c1-1200 | head -n 40 \
+    | awk -v u="$C_CY" -v o="$C_OFF" \
+        '/^### / { sub(/^### /, ""); print u "▌ " $0 o; next } { print }'
+}
+
+# --- modi ------------------------------------------------------------------
+
+cmd_projects() {
+  need_fzf
+  local tmp dir proj hist line mtime file label rt gcol gc p_gcol p_rt star fav here out rc key sel
+  local here_proj pwdreal codereal rest
+
+  # Welk project is de huidige werkmap? Submappen en worktrees ónder een
+  # projectmap tellen mee: we nemen het eerste padsegment onder $CODE. Zit je
+  # buiten $CODE (of in $CODE zelf), dan blijft dit leeg en gedraagt cx zich als
+  # vanouds (favorieten bovenaan). pwd -P zodat symlinks en een $CODE-symlink matchen.
+  here_proj=""
+  pwdreal=$(pwd -P 2>/dev/null)
+  codereal=$(cd "$CODE" 2>/dev/null && pwd -P)
+  if [ -n "$codereal" ] && [ -n "$pwdreal" ]; then
+    case "$pwdreal" in
+      "$codereal"/*) rest="${pwdreal#"$codereal"/}"; here_proj="${rest%%/*}" ;;
+    esac
+  fi
+
+  while true; do
+    tmp=$(mktemp)
+    for dir in "$CODE"/*/; do
+      proj=$(basename "$dir")
+      [ "$proj" = ".claude" ] && continue
+      hist=$(hist_dir_for "${dir%/}")
+      line=$(latest_session "$hist")
+      if [ -n "$line" ]; then
+        mtime=${line%% *}; file=${line#* }
+        label=$(session_label "$file"); rt=$(reltime "$mtime")
+      else
+        mtime=0; file=""; rt="—"; label="(geen sessies)"
+      fi
+      gcol=$(git_col "${dir%/}")
+      case "$gcol" in *\*) gc="$C_DIRTY" ;; "") gc="" ;; *) gc="$C_OK" ;; esac
+      p_gcol=$(printf '%-14s' "$gcol"); [ -n "$gc" ] && p_gcol="${gc}${p_gcol}${C_OFF}"
+      p_rt=$(printf '%-11s' "$rt"); p_rt="${C_DIM}${p_rt}${C_OFF}"
+      if is_fav "$proj"; then fav=1; else fav=0; fi
+      if [ -n "$here_proj" ] && [ "$proj" = "$here_proj" ]; then here=1; else here=0; fi
+      # markering: 'hier' (▸) wint van favoriet (★); anders een spatie zodat de
+      # kolom even breed blijft en de projectnamen uitgelijnd staan
+      if   [ "$here" = 1 ]; then star="${C_CY}▸${C_OFF}"
+      elif [ "$fav"  = 1 ]; then star="${C_STAR}★${C_OFF}"
+      else                       star=" "
+      fi
+      # velden: here \t fav \t mtime \t proj \t file \t weergave
+      printf '%s\t%s\t%s\t%s\t%s\t%s %-20s %s %s %s\n' \
+        "$here" "$fav" "$mtime" "$proj" "$file" "$star" "$proj" "$p_gcol" "$p_rt" "$label" >> "$tmp"
+    done
+
+    out=$(sort -t$'\t' -k1,1nr -k2,2nr -k3,3nr "$tmp" | cut -f4- \
+      | fzf --ansi --delimiter='\t' --with-nth=3 --expect=ctrl-n \
+            --prompt='project> ' \
+            --preview='cx _preview {2}' --preview-window='down:45%:wrap' \
+            --header='enter = sessies · ctrl-n = nieuwe sessie · ▸ hier · ★ favoriet · esc = stop')
+    rc=$?
+    rm -f "$tmp"
+    [ "$rc" -ge 130 ] && return 0            # esc/ctrl-c = stop
+    [ "$rc" -ge 2 ] && { echo "cx: fzf faalde (exit $rc)"; return 1; }
+    [ -z "$out" ] && continue                # enter zonder match: opnieuw
+    key=$(printf '%s\n' "$out" | head -1)
+    sel=$(printf '%s\n' "$out" | sed -n '2p')
+    [ -z "$sel" ] && continue
+    proj=$(printf '%s' "$sel" | cut -f1)
+
+    if [ "$key" = "ctrl-n" ]; then
+      cd "$CODE/$proj" || { echo "cx: kan niet naar $CODE/$proj"; exit 1; }
+      launch_flash "→ nieuwe sessie in $proj"; launch new "$proj"
+    fi
+    cmd_project_sessions "$proj"   # esc daar = terug in deze lus
+  done
+}
+
+# Drill-in: de sessielijst van één project. Enter opent (--resume), ctrl-n
+# start een nieuwe sessie, ctrl-f zoekt full-text binnen dit project,
+# esc keert terug naar de aanroeper (projectoverzicht of shell).
+cmd_project_sessions() {
+  need_fzf
+  local proj dir
+  proj=$(canon_proj "$1") || { echo "cx: geen project '$1' onder $CODE"; exit 1; }
+  dir="$CODE/$proj"
+  local tmp tmp2 total count out rc key sel term mtime id cwd rel f label rt sub
+
+  while true; do
+    tmp=$(mktemp)
+    project_sessions "$dir" | sort -t$'\t' -k1,1 -rn > "$tmp"
+
+    if [ ! -s "$tmp" ]; then
+      rm -f "$tmp"
+      cd "$dir" || exit 1
+      launch_flash "→ nog geen sessies in $proj, ik start een nieuwe"
+      launch new "$proj"
+    fi
+
+    total=$(wc -l < "$tmp" | tr -d ' ')
+    count="$total sessies"
+    [ "$total" -gt 40 ] && count="40 van $total sessies · ctrl-f doorzoekt alles"
+
+    # velden: id \t file \t cwd \t weergave
+    tmp2=$(mktemp)
+    head -40 "$tmp" | while IFS=$'\t' read -r mtime id cwd f rel; do
+      label=$(session_label "$f")
+      rt=$(printf '%-11s' "$(reltime "$mtime")"); rt="${C_DIM}${rt}${C_OFF}"
+      sub=""; [ -n "$rel" ] && sub="${C_CY}↳$rel · ${C_OFF}"
+      printf '%s\t%s\t%s\t%s %s%s\n' "$id" "$f" "$cwd" "$rt" "$sub" "$label" >> "$tmp2"
+    done
+    rm -f "$tmp"
+
+    out=$(fzf < "$tmp2" --ansi --delimiter='\t' --with-nth=4 \
+            --expect=esc,ctrl-n,ctrl-f \
+            --prompt="sessie ($proj)> " \
+            --preview='cx _preview {2}' --preview-window='down:45%:wrap' \
+            --header="$proj · $count · enter = open · ctrl-n = nieuw · ctrl-f = zoek in inhoud · esc = terug")
+    rc=$?
+    rm -f "$tmp2"
+    [ "$rc" -ge 130 ] && exit 0                # ctrl-c: cx helemaal stoppen
+    [ "$rc" -ge 2 ] && { echo "cx: fzf faalde (exit $rc)"; exit 1; }
+    [ -z "$out" ] && continue                  # enter zonder match: lijst blijft
+    key=$(printf '%s\n' "$out" | head -1)
+    sel=$(printf '%s\n' "$out" | sed -n '2p')
+    case "$key" in
+      esc)    return 0 ;;
+      ctrl-n) cd "$dir" || exit 1
+              launch_flash "→ nieuwe sessie in $proj"; launch new "$proj" ;;
+      ctrl-f) term=""
+              printf 'zoek in %s: ' "$proj"; read -r term
+              [ -n "$term" ] && cmd_project_grep "$proj" "$term" ;;
+      *)      [ -n "$sel" ] && open_session_row "$proj" "$sel" ;;
+    esac
+  done
+}
+
+# Full-text zoeken binnen de sessies van één project (alle, ook voorbij de
+# cap van de lijst). Esc keert terug naar de sessielijst.
+cmd_project_grep() {
+  local proj="$1"; shift
+  local term="$*" dir="$CODE/$proj"
+  local rows tmp2 hits esct mtime id cwd rel f rt snip sub out rc key sel
+  rows=$(mktemp)
+  project_sessions "$dir" | sort -t$'\t' -k1,1 -rn > "$rows"
+
+  # de term is letterlijke tekst: -F voor de match, en voor het snippetpatroon
+  # escapen we de BRE-metatekens
+  esct=$(printf '%s' "$term" | sed 's/[][\.*^$]/\\&/g')
+  tmp2=$(mktemp); hits=0
+  while IFS=$'\t' read -r mtime id cwd f rel; do
+    grep -Fiqa -- "$term" "$f" 2>/dev/null || continue
+    rt=$(printf '%-11s' "$(reltime "$mtime")"); rt="${C_DIM}${rt}${C_OFF}"
+    snip=$(grep -ioam1 -- ".\{0,25\}$esct.\{0,45\}" "$f" 2>/dev/null | tr '\t\n' '  ' | cut -c1-78)
+    [ -z "$snip" ] && snip=$(session_label "$f")
+    sub=""; [ -n "$rel" ] && sub="${C_CY}↳$rel · ${C_OFF}"
+    printf '%s\t%s\t%s\t%s %s%s\n' "$id" "$f" "$cwd" "$rt" "$sub" "$snip" >> "$tmp2"
+    hits=$((hits + 1)); [ "$hits" -ge 40 ] && break
+  done < "$rows"
+  rm -f "$rows"
+
+  if [ ! -s "$tmp2" ]; then
+    echo "cx: niets gevonden voor '$term' in $proj"
+    rm -f "$tmp2"; return 0
+  fi
+
+  out=$(fzf < "$tmp2" --ansi --delimiter='\t' --with-nth=4 \
+          --expect=esc \
+          --prompt="zoek:$term> " \
+          --preview='cx _preview {2}' --preview-window='down:45%:wrap' \
+          --header="$hits treffers voor '$term' in $proj · enter = open · esc = terug")
+  rc=$?
+  rm -f "$tmp2"
+  [ "$rc" -ge 130 ] && exit 0                  # ctrl-c: cx helemaal stoppen
+  [ "$rc" -ge 2 ] && { echo "cx: fzf faalde (exit $rc)"; exit 1; }
+  [ -z "$out" ] && return 0                    # enter zonder match: terug naar lijst
+  key=$(printf '%s\n' "$out" | head -1)
+  sel=$(printf '%s\n' "$out" | sed -n '2p')
+  [ "$key" = "esc" ] && return 0
+  [ -n "$sel" ] && open_session_row "$proj" "$sel"
+  return 0
+}
+
+cmd_sessions() {
+  need_fzf
+  # 1) verzamel goedkoop alle sessies (mtime, project, sessie-id) en sorteer
+  local tmp; tmp=$(mktemp)
+  local dir proj enc hist f mtime id
+  for dir in "$CODE"/*/; do
+    proj=$(basename "$dir")
+    [ "$proj" = ".claude" ] && continue
+    hist=$(hist_dir_for "${dir%/}")
+    [ -d "$hist" ] || continue
+    while IFS= read -r line; do
+      mtime=${line%% *}; f=${line#* }
+      id=$(basename "$f" .jsonl)
+      printf '%s\t%s\t%s\t%s\n' "$mtime" "$proj" "$id" "$f" >> "$tmp"
+    done < <(find "$hist" -maxdepth 1 -name '*.jsonl' -print0 2>/dev/null \
+              | xargs -0 stat -f '%m %N' 2>/dev/null)
+  done
+
+  # 2) label alleen de 40 recentste (snel houden)
+  local tmp2; tmp2=$(mktemp)
+  sort -t$'\t' -k1,1 -rn "$tmp" | head -40 | while IFS=$'\t' read -r mtime proj id f; do
+    local label rt
+    label=$(session_label "$f")
+    rt=$(reltime "$mtime")
+    # velden: proj \t id \t file \t weergave
+    printf '%s\t%s\t%s\t%-18s %-11s %s\n' "$proj" "$id" "$f" "$proj" "$rt" "$label" >> "$tmp2"
+  done
+
+  local sel proj id dir
+  sel=$(fzf < "$tmp2" --delimiter='\t' --with-nth=4 \
+          --preview='cx _preview {3}' --preview-window='down:45%:wrap' \
+          --prompt='sessie> ' --header='enter = open deze sessie · esc = stop')
+  rm -f "$tmp" "$tmp2"
+  [ -z "$sel" ] && return 0
+  proj=$(printf '%s' "$sel" | cut -f1)
+  id=$(printf '%s' "$sel" | cut -f2)
+  f=$(printf '%s' "$sel" | cut -f3)
+  dir="$CODE/$proj"
+  cd "$dir" || { echo "cx: kan niet naar $dir"; exit 1; }
+  recap_card "$proj" "$f" "$dir"
+  launch_flash "→ open sessie in $proj"; launch resume "$proj" "$id"
+}
+
+cmd_grep() {
+  need_fzf
+  local term="$*"
+  [ -z "$term" ] && { echo "gebruik: cx grep <zoekterm>"; exit 1; }
+  local tmp; tmp=$(mktemp)
+  anim_on || echo "zoeken naar '$term' in al je sessies..." >&2
+  # het zoeken over alle projecten in de achtergrond, met spinner ervoor
+  (
+    local dir proj hist f mtime id
+    for dir in "$CODE"/*/; do
+      proj=$(basename "$dir"); [ "$proj" = ".claude" ] && continue
+      hist=$(hist_dir_for "${dir%/}"); [ -d "$hist" ] || continue
+      while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        mtime=$(stat -f '%m' "$f" 2>/dev/null); id=$(basename "$f" .jsonl)
+        printf '%s\t%s\t%s\t%s\n' "$mtime" "$proj" "$id" "$f" >> "$tmp"
+      done < <(grep -ila -- "$term" "$hist"/*.jsonl 2>/dev/null)
+    done
+  ) &
+  spin_pid "zoeken naar '$term' in al je sessies…" $!
+  if [ ! -s "$tmp" ]; then echo "cx: niets gevonden voor '$term'"; rm -f "$tmp"; return 0; fi
+
+  local tmp2; tmp2=$(mktemp)
+  sort -t$'\t' -k1,1 -rn "$tmp" | head -40 | while IFS=$'\t' read -r mtime proj id f; do
+    local rt snip
+    rt=$(reltime "$mtime")
+    snip=$(grep -ioam1 -- ".\{0,25\}$term.\{0,45\}" "$f" 2>/dev/null | tr '\t\n' '  ' | cut -c1-78)
+    [ -z "$snip" ] && snip=$(session_label "$f")
+    printf '%s\t%s\t%s\t%-18s %-11s %s\n' "$proj" "$id" "$f" "$proj" "$rt" "$snip" >> "$tmp2"
+  done
+
+  local sel proj id dir
+  sel=$(fzf < "$tmp2" --delimiter='\t' --with-nth=4 \
+          --preview='cx _preview {3}' --preview-window='down:45%:wrap' \
+          --prompt="grep:$term> " --header='enter = open sessie · esc = stop')
+  rm -f "$tmp" "$tmp2"
+  [ -z "$sel" ] && return 0
+  proj=$(printf '%s' "$sel" | cut -f1); id=$(printf '%s' "$sel" | cut -f2)
+  f=$(printf '%s' "$sel" | cut -f3)
+  dir="$CODE/$proj"; cd "$dir" || { echo "cx: kan niet naar $dir"; exit 1; }
+  recap_card "$proj" "$f" "$dir"
+  launch_flash "→ open sessie in $proj"; launch resume "$proj" "$id"
+}
+
+# Aantal recentste sessies dat cx ask aan Claude voorlegt.
+CX_ASK_LIMIT="${CX_ASK_LIMIT:-120}"
+
+cmd_ask() {
+  need_fzf
+  command -v claude >/dev/null || { echo "cx: claude CLI niet gevonden"; exit 1; }
+  local q="$*"
+  [ -z "$q" ] && { echo "gebruik: cx ask \"<vraag in gewone taal>\""; exit 1; }
+
+  # 1) catalogus van recente sessies opbouwen: id \t project \t file \t label
+  local tmp; tmp=$(mktemp)
+  local dir proj hist f mtime id
+  for dir in "$CODE"/*/; do
+    proj=$(basename "$dir"); [ "$proj" = ".claude" ] && continue
+    hist=$(hist_dir_for "${dir%/}"); [ -d "$hist" ] || continue
+    while IFS= read -r line; do
+      mtime=${line%% *}; f=${line#* }; id=$(basename "$f" .jsonl)
+      printf '%s\t%s\t%s\t%s\n' "$mtime" "$proj" "$id" "$f" >> "$tmp"
+    done < <(find "$hist" -maxdepth 1 -name '*.jsonl' -print0 2>/dev/null \
+              | xargs -0 stat -f '%m %N' 2>/dev/null)
+  done
+  [ -s "$tmp" ] || { echo "cx: geen sessies gevonden"; rm -f "$tmp"; return 0; }
+
+  local cat; cat=$(mktemp)          # id \t project \t file \t label
+  local prompt_cat; prompt_cat=$(mktemp)  # regels voor Claude: id :: [project] label
+  sort -t$'\t' -k1,1 -rn "$tmp" | head -n "$CX_ASK_LIMIT" \
+    | while IFS=$'\t' read -r mtime proj id f; do
+        local label; label=$(session_label "$f")
+        printf '%s\t%s\t%s\t%s\n' "$id" "$proj" "$f" "$label" >> "$cat"
+        printf '%s :: [%s] %s\n' "$id" "$proj" "$label" >> "$prompt_cat"
+      done
+
+  # 2) Claude laten rangschikken (headless, gebruikt je eigen Claude Code)
+  local instr out ansf
+  instr="Hieronder staat een lijst Claude Code-sessies, één per regel in het formaat:
+<sessie-id> :: [project] eerste bericht van die sessie
+
+De gebruiker zoekt de sessie(s) die horen bij deze vraag:
+\"$q\"
+
+Geef de maximaal 6 meest relevante sessie-ids terug, gesorteerd van best naar minder goed passend.
+Eén per regel, exact dit formaat en niets anders:
+<sessie-id> | <reden in maximaal 8 woorden>
+
+Sessies:
+$(cat "$prompt_cat")"
+
+  # werk in de achtergrond zodat de spinner kan draaien; stdout naar een file,
+  # tekst blijft onaangetast. Zonder spinner (geen tty) tonen we de statische
+  # melding zodat het scherm niet stil lijkt te hangen.
+  ansf=$(mktemp)
+  anim_on || echo "Claude zoekt de best passende sessies..." >&2
+  ( printf '%s' "$instr" | timeout 90 claude -p >"$ansf" 2>/dev/null ) &
+  spin_pid "Claude zoekt de best passende sessies…" $!
+  out=$(cat "$ansf"); rm -f "$ansf"
+
+  # 3) ids uit het antwoord halen en koppelen aan project/file
+  local tmp2; tmp2=$(mktemp)
+  printf '%s\n' "$out" | grep -oiE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}( *\| *.*)?' \
+    | while IFS= read -r hit; do
+        local rid reason row proj f label
+        rid=$(printf '%s' "$hit" | grep -oiE '^[0-9a-f-]{36}')
+        reason=$(printf '%s' "$hit" | sed -E 's/^[0-9a-fA-F-]{36} *\|? *//' | cut -c1-50)
+        row=$(grep -F "$rid	" "$cat" | head -1) || continue
+        [ -z "$row" ] && continue
+        proj=$(printf '%s' "$row" | cut -f2)
+        f=$(printf '%s' "$row" | cut -f3)
+        label=$(printf '%s' "$row" | cut -f4)
+        [ -z "$reason" ] && reason="$label"
+        printf '%s\t%s\t%s\t%-18s %s\n' "$proj" "$rid" "$f" "$proj" "$reason" >> "$tmp2"
+      done
+  rm -f "$tmp" "$cat" "$prompt_cat"
+
+  if [ ! -s "$tmp2" ]; then
+    echo "cx: Claude vond geen duidelijke match. Probeer 'cx grep' of herformuleer."
+    rm -f "$tmp2"; return 0
+  fi
+
+  local sel proj id dir
+  sel=$(fzf < "$tmp2" --delimiter='\t' --with-nth=4 \
+          --preview='cx _preview {3}' --preview-window='down:45%:wrap' \
+          --prompt="ask> " --header="vraag: $q · enter = open · esc = stop")
+  rm -f "$tmp2"
+  [ -z "$sel" ] && return 0
+  proj=$(printf '%s' "$sel" | cut -f1); id=$(printf '%s' "$sel" | cut -f2)
+  f=$(printf '%s' "$sel" | cut -f3)
+  dir="$CODE/$proj"; cd "$dir" || { echo "cx: kan niet naar $dir"; exit 1; }
+  recap_card "$proj" "$f" "$dir"
+  launch_flash "→ open sessie in $proj"; launch resume "$proj" "$id"
+}
+
+cmd_pin() {
+  local p="${1:-}"; [ -z "$p" ] && { echo "gebruik: cx pin <project>"; exit 1; }
+  [ -d "$CODE/$p" ] || { echo "cx: geen project '$p' onder $CODE"; exit 1; }
+  touch "$FAV_FILE"
+  grep -qxF "$p" "$FAV_FILE" || echo "$p" >> "$FAV_FILE"
+  echo "★ vastgezet: $p"
+}
+
+cmd_unpin() {
+  local p="${1:-}"; [ -z "$p" ] && { echo "gebruik: cx unpin <project>"; exit 1; }
+  [ -f "$FAV_FILE" ] || return 0
+  grep -vxF "$p" "$FAV_FILE" > "$FAV_FILE.tmp" 2>/dev/null && mv "$FAV_FILE.tmp" "$FAV_FILE"
+  echo "losgemaakt: $p"
+}
+
+cmd_new() {
+  local naam="${1:-}"
+  if [ -z "$naam" ]; then
+    read -r -p "Naam nieuw project: " naam
+  fi
+  [ -z "$naam" ] && { echo "cx: geen naam opgegeven"; exit 1; }
+  local dir="$CODE/$naam"
+  if [ -d "$dir" ]; then
+    echo "cx: $dir bestaat al — ik start daar gewoon."
+  else
+    mkdir -p "$dir"
+    cat > "$dir/CLAUDE.md" <<EOF
+# $naam
+
+_Waar gaat dit project over? Vul aan tijdens je eerste sessie._
+EOF
+    echo "→ aangemaakt: $dir"
+  fi
+  cd "$dir" || exit 1
+  launch_flash "→ nieuwe sessie in $naam"
+  launch new "$naam"
+}
+
+# Lees name + description uit de frontmatter van een SKILL.md -> "name\tdesc".
+skill_meta() {
+  awk '
+    NR==1 && $0 !~ /^---/ { exit }
+    /^---/ { c++; if (c==2) exit; next }
+    /^name:/        { s=$0; sub(/^name:[[:space:]]*/,"",s);        gsub(/^["'\'']|["'\'']$/,"",s); n=s }
+    /^description:/ { s=$0; sub(/^description:[[:space:]]*/,"",s); gsub(/^["'\'']|["'\'']$/,"",s); d=s }
+    END { print n "\t" d }
+  ' "$1" 2>/dev/null
+}
+
+# Korte bronlabel afleiden uit het pad.
+skill_source() {
+  case "$1" in
+    "$PWD/.claude/skills/"*)  echo "project" ;;
+    "$HOME/.claude/skills/"*) echo "user" ;;
+    *"/plugins/"*)
+      # naam van de marketplace/plugin na /marketplaces/ of /cache/
+      echo "$1" | sed -nE 's#.*/(marketplaces|cache)/([^/]+)/.*#\2#p' | head -1 \
+        | sed 's/^$/plugin/' ;;
+    *) echo "?" ;;
+  esac
+}
+
+cmd_skills() {
+  need_fzf
+  local tmp; tmp=$(mktemp)
+  local f meta name desc src
+  {
+    [ -d "$HOME/.claude/skills" ]   && find "$HOME/.claude/skills"   -name 'SKILL.md' 2>/dev/null
+    [ -d "$HOME/.claude/plugins" ]  && find "$HOME/.claude/plugins"  -name 'SKILL.md' 2>/dev/null
+    [ -d "$PWD/.claude/skills" ]    && find "$PWD/.claude/skills"    -name 'SKILL.md' 2>/dev/null
+  } | sort -u | while IFS= read -r f; do
+    meta=$(skill_meta "$f")
+    name=${meta%%$'\t'*}; desc=${meta#*$'\t'}
+    [ -z "$name" ] && name=$(basename "$(dirname "$f")")
+    src=$(skill_source "$f"); [ -z "$src" ] && src="?"
+    printf '%s\t%-30s %-22s %s\n' "$f" "$name" "[$src]" "${desc:0:100}" >> "$tmp"
+  done
+
+  local count sel f
+  count=$(wc -l < "$tmp" | tr -d ' ')
+  sel=$(sort -t$'\t' -k2 "$tmp" | fzf --delimiter='\t' --with-nth=2 \
+          --prompt='skill> ' \
+          --header="$count skills   ·   enter = pad tonen   ·   esc = stop" \
+          --preview='sed -n "1,160p" {1}' --preview-window='right:55%:wrap')
+  rm -f "$tmp"
+  [ -z "$sel" ] && return 0
+  f=$(printf '%s' "$sel" | cut -f1)
+  echo "$f"
+}
+
+cmd_help() {
+  cat <<'EOF'
+cx — Claude Code project & sessie launcher
+
+  cx              overzicht van je projecten onder ~/code; enter opent de
+                  sessielijst van dat project (drill-in), ctrl-n = verse sessie.
+                  Zit je in een projectmap, dan staat die (▸) bovenaan met de
+                  cursor er al op; daarna favorieten (★), git-branch + preview.
+                  In de sessielijst: enter = open, ctrl-n = nieuw,
+                  ctrl-f = zoek in inhoud, esc = terug. Enter-enter = verder
+                  waar je was. Sessies uit submappen/worktrees tellen mee (↳).
+  cx sessions     alle recente sessies over alle projecten (projectroots)
+  cx sessions <p> de sessielijst van één project (zelfde als enter in cx)
+  cx grep <term>  full-text zoeken door je sessies (projectroots); submap- en
+                  worktree-sessies doorzoek je met ctrl-f in de drill-in
+  cx ask "<vraag>" semantisch zoeken: Claude kiest de best passende sessie(s)
+                  uit je historie (gebruikt je eigen Claude Code, geen API)
+  cx skills       doorzoek al je skills (user, plugins, project) met preview
+  cx pin <proj>   project als favoriet bovenaan zetten
+  cx unpin <proj> favoriet weer losmaken
+  cx new [naam]   maak ~/code/<naam> aan met een kale CLAUDE.md en start claude
+  cx <naam>       direct de sessielijst van dat project openen zonder menu
+  cx _animdemo    speel alle animaties één keer af (om timing/stijl te bekijken)
+  cx version      toon de versie
+  cx help         deze uitleg
+
+Labels zijn de AI-titels die Claude Code zelf per sessie genereert (fallback:
+het eerste bericht). Bij het openen van een sessie toont cx eerst een korte
+recap-card: waar je was, je laatste vraag en waar Claude bleef.
+
+Instellingen (env-vars, bijv. in ~/.zshrc):
+  CX_SKIP_PERMISSIONS=1   start claude altijd met --dangerously-skip-permissions (0 = uit)
+  CX_CODE_DIR=~/code      waar je projecten staan
+  CX_COLOR=1              kleur in lijsten, preview en recap-card (0 = uit)
+  CX_RECAP=1              recap-card vóór het openen van een sessie (0 = uit)
+  CX_ANIM=1               subtiele animaties: spinners, recap-intro, sweeps
+                          (0 = uit; ook automatisch uit als de output geen terminal is)
+  CX_SESSION_COLOR=1      elke sessie een eigen prompt-bar kleur, zodat je met
+                          meerdere tabs open ziet welke welke is (0 = uit)
+
+Puur lokaal: leest je bestaande ~/.claude/projects historie en start de
+claude CLI. Geen API, geen achtergrondproces.
+EOF
+}
+
+# Speelt elke animatie één keer af met een label, zodat je timing en stijl
+# kunt beoordelen zonder claude te starten. Forceert CX_ANIM=1 voor de demo.
+cmd_animdemo() {
+  CX_ANIM=1
+  if [ ! -t 1 ]; then echo "cx _animdemo: draai dit in een echte terminal"; return 0; fi
+  printf '%s— cx animatiedemo —%s\n\n' "$C_BOLD" "$C_OFF"
+
+  printf '%s1. opstart-banner%s\n' "$C_DIM" "$C_OFF"; cx_banner; nap 0.3
+
+  printf '\n%s2. overgang naar claude (launch_flash)%s\n' "$C_DIM" "$C_OFF"
+  launch_flash "→ open sessie in demo"; nap 0.3
+
+  printf '\n%s3. spinner (2s werk simuleren)%s\n' "$C_DIM" "$C_OFF"
+  ( nap 2 ) & spin_pid "bezig met iets dat even duurt…" $!
+
+  printf '\n%s4. recap-card intro%s\n\n' "$C_DIM" "$C_OFF"
+  local B="${C_CY}▌${C_OFF}"
+  printf '%s %sdemo · main* · zojuist%s\n' "$B" "$C_DIM" "$C_OFF"; nap 0.035
+  printf '%s %sEen voorbeeldsessie met een mooie titel%s\n' "$B" "$C_BOLD" "$C_OFF"; nap 0.035
+  printf '%s\n' "$B"; nap 0.035
+  printf '%s %sJij, als laatste:%s   commit push en deploy\n' "$B" "$C_CY" "$C_OFF"; nap 0.035
+  printf '%s %sClaude bleef bij:%s   Live en gezond, alles verwerkt\n' "$B" "$C_DIM" "$C_OFF"; nap 0.035
+
+  printf '\n%sKlaar. Uit te zetten met CX_ANIM=0.%s\n' "$C_DIM" "$C_OFF"
+}
+
+# --- router ----------------------------------------------------------------
+
+case "${1:-}" in
+  ""|projects|p) cx_banner; cmd_projects ;;
+  sessions|s)    shift
+                 if [ -n "${1:-}" ]; then cmd_project_sessions "$1"; else cmd_sessions; fi ;;
+  skills|skill)  cmd_skills ;;
+  grep|g)        shift; cmd_grep "$@" ;;
+  ask|a)         shift; cmd_ask "$@" ;;
+  pin)           shift; cmd_pin "${1:-}" ;;
+  unpin)         shift; cmd_unpin "${1:-}" ;;
+  _preview)      shift; cmd_preview "${1:-}" ;;
+  _sessions)     shift; p=$(canon_proj "${1:?gebruik: cx _sessions <project>}") \
+                   || { echo "cx: geen project '$1' onder $CODE"; exit 1; }
+                 project_sessions "$CODE/$p" | sort -t$'\t' -k1,1 -rn ;;
+  _title)        shift; session_title "${1:?gebruik: cx _title <sessiebestand>}" ;;
+  _animdemo)     cmd_animdemo ;;
+  _recap)        shift; p=$(canon_proj "${1:?gebruik: cx _recap <project>}") \
+                   || { echo "cx: geen project '$1' onder $CODE"; exit 1; }
+                 row=$(project_sessions "$CODE/$p" | sort -t$'\t' -k1,1 -rn | head -1)
+                 [ -z "$row" ] && { echo "cx: geen sessies in $p"; exit 1; }
+                 recap_card "$p" "$(printf '%s' "$row" | cut -f4)" \
+                            "$(printf '%s' "$row" | cut -f3)" ;;
+  new|n)         shift; cmd_new "${1:-}" ;;
+  version|--version|-v) echo "cx $CX_VERSION" ;;
+  help|-h|--help) cmd_help ;;
+  *)
+    # `cx <projectnaam>` als sneltoets: direct de drill-in van dat project
+    if [ -d "$CODE/$1" ]; then
+      cmd_project_sessions "$1"
+    else
+      echo "cx: onbekend commando of project: $1"; echo; cmd_help; exit 1
+    fi
+    ;;
+esac

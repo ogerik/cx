@@ -113,6 +113,23 @@ Je sessie-historie blijft daarbij intact: die is van Claude Code zelf en staat i
 - `jq` — JSON parsing (`brew install jq`)
 - `git` — voor de branch-kolom (optioneel)
 
+## Werkt het niet?
+
+Ziet `cx` geen projecten of geen sessies, draai dan de diagnose. Die verandert niets,
+leest alleen en zegt wat er mis is:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ogerik/cx/main/doctor.sh | bash
+```
+
+Of, als je de repo al hebt: `~/code/cx/doctor.sh`.
+
+Twee veelvoorkomende oorzaken die de diagnose vindt:
+
+- **Je projecten staan niet in `~/code`.** Zet `CX_CODE_DIR` naar je eigen map.
+- **Je draait Linux of WSL.** `cx` leest tijdstempels met de macOS-vorm van `stat`;
+  op Linux vindt het daardoor geen sessies. Nog niet opgelost.
+
 ## Instellingen
 
 Te overschrijven via env-vars, bijvoorbeeld in je `~/.zshrc`:
